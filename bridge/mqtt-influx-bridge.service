@@ -1,0 +1,15 @@
+[Unit]
+Description=MQTT to InfluxDB Bridge (IoMT project)
+After=network.target mosquitto.service influxdb.service
+Requires=mosquitto.service influxdb.service
+
+[Service]
+Type=simple
+User=mvvm
+WorkingDirectory=/home/mvvm/iomt-mqtt/bridge
+ExecStart=/usr/bin/python3 /home/mvvm/iomt-mqtt/bridge/mqtt_influx_bridge.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
