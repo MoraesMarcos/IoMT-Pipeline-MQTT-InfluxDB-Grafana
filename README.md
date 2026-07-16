@@ -1,222 +1,212 @@
-# IoMT — Pipeline MQTT → InfluxDB → Grafana
+# IoMT — MQTT → InfluxDB → Grafana Pipeline
 
-Reimplementação do pipeline de dados usando MQTT de fato (em vez do HTTP
-direto que estava em produção), para ficar alinhado com a arquitetura
-descrita no artigo, mais um experimento de carga crescente com medição de
-latência, jitter, perda de mensagens, CPU e memória.
+Reimplementation of the data pipeline using MQTT for real (instead of the
+direct HTTP that was in production), to align with the architecture
+described in the paper, plus an increasing-load experiment measuring
+latency, jitter, message loss, CPU and memory usage.
 
-> ⚠️ **Status:** todo o código abaixo foi escrito e validado localmente
-> (sintaxe compilada, funções de cálculo testadas isoladamente), mas **ainda
-> não foi executado contra o Mosquitto/InfluxDB reais do servidor**
-> (`200.133.17.234`), por indisponibilidade de rede/VPN no momento da
-> escrita. Antes de citar qualquer valor no artigo como resultado
-> experimental, rode a seção [Validação end-to-end](#validação-end-to-end) e
-> o [experimento de carga](#experimento-de-carga-crescente) no servidor de
-> fato.
+> ⚠️ **Status:** all the code below was written and validated locally
+> (syntax compiled, calculation functions tested in isolation), but **has
+> not yet been executed against the real Mosquitto/InfluxDB on the server**
+> (`200.133.17.234`), due to network/VPN unavailability at the time of
+> writing. Before citing any value in the paper as an experimental result,
+> run the [End-to-end validation](#end-to-end-validation) section and the
+> [load experiment](#increasing-load-experiment) on the actual server.
 
-## Estrutura do repositório
+## Repository structure
 
 ```
 iomt-mqtt/
 ├── firmware/
-│   └── firmware_mqtt.ino       # ESP8266, publica via MQTT (PubSubClient)
+│   └── firmware_mqtt.ino       # ESP8266, publishes via MQTT (PubSubClient)
 ├── bridge/
-│   ├── mqtt_influx_bridge.py   # Subscreve MQTT, grava no InfluxDB 1.6.7
+│   ├── mqtt_influx_bridge.py   # Subscribes to MQTT, writes to InfluxDB 1.6.7
 │   ├── mqtt-influx-bridge.service
 │   └── requirements.txt
 ├── load-test/
-│   ├── load_test.py            # Publica em taxa crescente, mede RTT/jitter/perda
-│   ├── echo_responder.py       # Confirma recebimento p/ permitir medir RTT
-│   ├── resource_monitor.py     # Amostra CPU/memória do servidor durante o teste
+│   ├── load_test.py            # Publishes at increasing rate, measures RTT/jitter/loss
+│   ├── echo_responder.py       # Acknowledges receipt so RTT can be measured
+│   ├── resource_monitor.py     # Samples server CPU/memory during the test
 │   └── requirements.txt
 └── .gitignore
 ```
 
-## Contexto: por que MQTT em vez de HTTP
+## Context: why MQTT instead of HTTP
 
-O firmware original enviava os dados via `ESP8266HTTPClient`, com POST
-direto para a API REST do InfluxDB — sem broker MQTT no meio, apesar do
-artigo descrever essa etapa como parte central da arquitetura (Seção 5,
-Figura 2 e 4). O banco `mqtt_data` já existia com esse nome, mas não estava
-sendo usado por um pipeline MQTT de fato: o Mosquitto estava instalado e
-ativo no servidor, porém sem nenhum publisher ou subscriber conectado a ele.
+The original firmware sent data via `ESP8266HTTPClient`, with a direct POST
+to the InfluxDB REST API — with no MQTT broker in between, even though the
+paper describes this step as a central part of the architecture (Section 5,
+Figures 2 and 4). The `mqtt_data` database already existed under that name,
+but it was not actually being fed by an MQTT pipeline: Mosquitto was
+installed and running on the server, but with no publisher or subscriber
+connected to it.
 
-Este diretório corrige essa divergência: o firmware agora publica via MQTT
-de verdade, e um bridge dedicado faz a ponte MQTT → InfluxDB.
+This directory fixes that mismatch: the firmware now publishes over MQTT
+for real, and a dedicated bridge handles the MQTT → InfluxDB hop.
 
-## Ambiente do servidor (confirmado via SSH)
+## Server environment
 
-| Item | Valor |
+| Item | Value |
 |---|---|
 | vCPUs | 4 |
 | RAM | 1.9 GiB |
-| Hypervisor | KVM (QEMU, hardware genérico "Standard PC i440FX + PIIX") |
-| SO | Debian GNU/Linux 12 (bookworm), kernel 5.10.0-10-amd64 |
+| Hypervisor | KVM (QEMU, generic hardware "Standard PC i440FX + PIIX") |
+| OS | Debian GNU/Linux 12 (bookworm), kernel 5.10.0-10-amd64 |
 | InfluxDB | 1.6.7, `auth-enabled = false` |
-| Broker MQTT | Mosquitto, configuração padrão (`/etc/mosquitto/conf.d/`) |
-| Grafana | ativo, dashboards em `Dashboards > MIMIC` |
+| MQTT broker | Mosquitto, default configuration (`/etc/mosquitto/conf.d/`) |
+| Grafana | active, dashboards under `Dashboards > MIMIC` |
 
-> Falta confirmar: se a VM é hospedagem local/própria ou provedor de nuvem
-> — o hostname (`pmr-srv-valentim`) e o hardware genérico QEMU sugerem
-> infraestrutura própria, mas isso não foi confirmado explicitamente.
+> Still to confirm: whether the VM is self-hosted (local server) or hosted
+> by a cloud provider — the hostname (`pmr-srv-valentim`) and the generic
+> QEMU hardware suggest self-hosted infrastructure, but this has not been
+> explicitly confirmed.
 
-## Componentes
+## Components
 
-- **`firmware/firmware_mqtt.ino`** — Firmware do ESP8266 que publica as
-  amostras (BPM/SpO2) via MQTT usando a lib `PubSubClient`, no tópico
-  `iomt/paciente/dados`. O array `dados[]` (amostras dos pacientes) foi
-  omitido por brevidade neste repositório — copie-o do firmware HTTP
-  original antes de compilar (ver [instruções abaixo](#como-gravaratualizar-o-firmware)).
-- **`bridge/mqtt_influx_bridge.py`** — Script Python que subscreve o tópico
-  MQTT e grava os pontos no InfluxDB 1.6.7 (biblioteca clássica `influxdb`,
-  não `influxdb-client`, que é para a v2.x), com batching configurável.
-  Como o InfluxDB 1.x não tem flush automático por tempo no cliente, o
-  batching por `flush_interval` foi implementado manualmente com uma thread
-  separada (`flusher_loop`).
-- **`bridge/mqtt-influx-bridge.service`** — Unit systemd para rodar o bridge
-  como serviço persistente, reiniciando automaticamente em caso de falha.
-- **`load-test/`** — três scripts para o experimento de carga crescente
-  (detalhes na seção própria abaixo).
+- **`firmware/firmware_mqtt.ino`** — ESP8266 firmware that publishes the
+  samples (BPM/SpO2) over MQTT using the `PubSubClient` library, on the
+  `iomt/paciente/dados` topic. The `dados[]` array (patient samples) was
+  omitted for brevity in this repository — copy it from the original HTTP
+  firmware before compiling (see [instructions below](#how-to-flashupdate-the-firmware)).
+- **`bridge/mqtt_influx_bridge.py`** — Python script that subscribes to the
+  MQTT topic and writes the points to InfluxDB 1.6.7 (the classic
+  `influxdb` library, not `influxdb-client`, which targets v2.x), with
+  configurable batching. Since InfluxDB 1.x has no built-in time-based
+  flush in the client, the `flush_interval` batching was implemented
+  manually via a separate thread (`flusher_loop`).
+- **`bridge/mqtt-influx-bridge.service`** — systemd unit to run the bridge
+  as a persistent service, restarting automatically on failure.
+- **`load-test/`** — three scripts for the increasing-load experiment
+  (details in its own section below).
 
-## Parâmetros de configuração (para a tabela do artigo)
+## Configuration parameters
 
-| Parâmetro | Valor | Onde está definido |
+| Parameter | Value | Defined in |
 |---|---|---|
-| MQTT QoS (publicação) | 0 | `firmware_mqtt.ino` — limitação da lib PubSubClient, que só publica em QoS 0 |
-| MQTT QoS (subscrição do bridge) | 1 | `mqtt_influx_bridge.py`, `MQTT_SUBSCRIBE_QOS` |
-| Broker keep-alive | 60 s | `firmware_mqtt.ino` (`MQTT_KEEPALIVE_S`) e `mqtt_influx_bridge.py` (`MQTT_KEEPALIVE_S`) |
-| InfluxDB write batch size | 50 pontos | `mqtt_influx_bridge.py`, `INFLUX_BATCH_SIZE` |
+| MQTT QoS (publish) | 0 | `firmware_mqtt.ino` — limitation of the PubSubClient library, which only publishes at QoS 0 |
+| MQTT QoS (bridge subscription) | 1 | `mqtt_influx_bridge.py`, `MQTT_SUBSCRIBE_QOS` |
+| Broker keep-alive | 60 s | `firmware_mqtt.ino` (`MQTT_KEEPALIVE_S`) and `mqtt_influx_bridge.py` (`MQTT_KEEPALIVE_S`) |
+| InfluxDB write batch size | 50 points | `mqtt_influx_bridge.py`, `INFLUX_BATCH_SIZE` |
 | InfluxDB flush interval | 2000 ms | `mqtt_influx_bridge.py`, `INFLUX_FLUSH_INTERVAL_MS` |
-| Grafana panel auto-refresh | 5 s | Confirmado direto no dashboard do Grafana |
+| Grafana panel auto-refresh | 5 s | Confirmed directly on the Grafana dashboard |
 
-> **Nota sobre QoS:** o valor efetivo ponta-a-ponta do pipeline é QoS 0,
-> porque a biblioteca PubSubClient usada no ESP8266 não implementa QoS 1/2
-> de verdade em `publish()` — mesmo que se declare a constante no código,
-> não há handshake de ACK real. Se for necessário QoS 1/2 de fato, troque a
-> lib do firmware para `AsyncMqttClient` ou `espMqttClient`. Documentar essa
-> limitação no artigo é mais correto do que declarar QoS 1 sem que o
-> comportamento real do publisher garanta isso.
+> **Note on QoS:** the effective end-to-end QoS of the pipeline is 0,
+> because the PubSubClient library used on the ESP8266 does not actually
+> implement QoS 1/2 in `publish()` — even if the constant is declared in
+> the code, there is no real ACK handshake. If true QoS 1/2 is required,
+> switch the firmware library to `AsyncMqttClient` or `espMqttClient`.
+> Documenting this limitation in the paper is more correct than claiming
+> QoS 1 when the publisher's actual behavior doesn't guarantee it.
 
-Ajuste `INFLUX_BATCH_SIZE` e `INFLUX_FLUSH_INTERVAL_MS` conforme os
-resultados do experimento de carga abaixo — são os dois parâmetros que mais
-afetam o trade-off entre throughput e latência de escrita no InfluxDB.
+Adjust `INFLUX_BATCH_SIZE` and `INFLUX_FLUSH_INTERVAL_MS` based on the
+results of the load experiment below — these are the two parameters that
+most affect the throughput vs. write-latency trade-off in InfluxDB.
 
-## Como implantar no servidor
+## How to deploy on the server
 
 ```bash
-# 1. Copiar o projeto inteiro para o servidor (firmware + bridge + load-test)
+# 1. Copy the whole project to the server (firmware + bridge + load-test)
 scp -r iomt-mqtt/ mvvm@200.133.17.234:/home/mvvm/iomt-mqtt
 
-# 2. No servidor, instalar as dependências do bridge
+# 2. On the server, install the bridge's dependencies
 cd /home/mvvm/iomt-mqtt/bridge
 pip3 install -r requirements.txt --break-system-packages
 
-# 3. Editar mqtt_influx_bridge.py e preencher, SE o servidor exigir auth:
+# 3. Edit mqtt_influx_bridge.py and fill in, IF the server requires auth:
 #    INFLUX_USERNAME, INFLUX_PASSWORD
-#    (hoje auth-enabled=false no InfluxDB, então pode deixar como None)
+#    (auth-enabled=false on InfluxDB today, so you can leave these as None)
 
-# 4. Testar manualmente antes de virar serviço
+# 4. Test manually before turning it into a service
 python3 mqtt_influx_bridge.py
-# (deixe rodando, publique uma amostra pelo firmware e confira se aparece no Grafana)
+# (leave it running, publish one sample via the firmware, and check it shows up in Grafana)
 
-# 5. Instalar como serviço systemd
+# 5. Install as a systemd service
 sudo cp mqtt-influx-bridge.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now mqtt-influx-bridge
 sudo systemctl status mqtt-influx-bridge
 ```
 
-## Como gravar/atualizar o firmware
+## How to flash/update the firmware
 
-1. Abra `firmware/firmware_mqtt.ino` na Arduino IDE.
-2. Instale a lib `PubSubClient` (Sketch > Include Library > Manage Libraries).
-3. Copie o array `dados[]` completo do firmware HTTP original para dentro
-   deste arquivo — foi omitido aqui por brevidade, mas os valores são
-   idênticos.
-4. Ajuste `rede`, `senha`, `mqtt_server` se necessário.
-5. Faça o upload para o ESP8266.
+1. Open `firmware/firmware_mqtt.ino` in the Arduino IDE.
+2. Install the `PubSubClient` library (Sketch > Include Library > Manage Libraries).
+3. Copy the full `dados[]` array from the original HTTP firmware into this
+   file — it was omitted here for brevity, but the values are identical.
+4. Adjust `rede`, `senha`, `mqtt_server` if needed.
+5. Upload to the ESP8266.
 
-## Validação end-to-end
+## End-to-end validation
 
-Depois de subir o bridge e o firmware:
+After deploying the bridge and the firmware:
 
 ```bash
-# Confirmar que o Mosquitto recebe mensagens (terminal separado)
+# Confirm Mosquitto is receiving messages (separate terminal)
 mosquitto_sub -h 200.133.17.234 -t "iomt/paciente/dados" -v
 
-# Confirmar que o bridge está escrevendo no InfluxDB
+# Confirm the bridge is writing to InfluxDB
 sudo journalctl -u mqtt-influx-bridge -f
 ```
 
-Se ambos mostrarem atividade em tempo real, o pipeline MQTT → InfluxDB →
-Grafana está funcional e os parâmetros da tabela acima passam a ser valores
-reais e citáveis no artigo.
+If both show live activity, the MQTT → InfluxDB → Grafana pipeline is
+functional and the parameters in the table above become real,
+paper-citable values.
 
-## Experimento de carga crescente
+## Increasing-load experiment
 
-Pasta `load-test/` — repete a metodologia de latência/jitter da Seção 6.4 do
-artigo (L_i = T_end − T_start, RTT), mas variando a taxa de publicação
-(mensagens/s) em vários níveis, e registrando também CPU e memória do
-servidor durante cada nível.
+`load-test/` folder — replicates the latency/jitter methodology from
+Section 6.4 of the paper (L_i = T_end − T_start, RTT), but varying the
+publication rate (messages/s) across several levels, and also recording
+server CPU and memory during each level.
 
-### Componentes
+### Components
 
-- **`load_test.py`** — publica mensagens em taxa crescente (`LOAD_LEVELS`,
-  editável) e mede latência (RTT), jitter e perda de mensagens, gravando um
-  CSV por nível de carga e um `summary.csv` consolidado.
-- **`echo_responder.py`** — necessário porque o bridge real
-  (`mqtt_influx_bridge.py`) só escreve no InfluxDB e não confirma
-  recebimento. Este script assina o tópico de teste e "ecoa" cada mensagem
-  de volta, permitindo medir RTT do mesmo jeito que o experimento original
-  da Seção 6.4.
-- **`resource_monitor.py`** — amostra CPU/memória (via `psutil`) a cada 1s
-  durante o teste, incluindo CPU individual dos processos `mosquitto`,
-  `influxd`, `grafana-server` e `python3` (o próprio bridge).
+- **`load_test.py`** — publishes messages at an increasing rate
+  (`LOAD_LEVELS`, editable) and measures latency (RTT), jitter and message
+  loss, writing one CSV per load level plus a consolidated `summary.csv`.
+- **`echo_responder.py`** — needed because the real bridge
+  (`mqtt_influx_bridge.py`) only writes to InfluxDB and doesn't acknowledge
+  receipt. This script subscribes to the test topic and "echoes" each
+  message back, allowing RTT to be measured the same way as the original
+  Section 6.4 experiment.
+- **`resource_monitor.py`** — samples CPU/memory (via `psutil`) every 1s
+  during the test, including individual CPU usage for the `mosquitto`,
+  `influxd`, `grafana-server` and `python3` (the bridge itself) processes.
 
-### Como rodar (3 terminais SSH simultâneos no servidor)
+### How to run (3 simultaneous SSH terminals on the server)
 
 ```bash
-# Instalar dependências (uma vez)
+# Install dependencies (once)
 cd /home/mvvm/iomt-mqtt/load-test
 pip3 install -r requirements.txt --break-system-packages
 
-# Terminal 1: monitor de recursos (deixe rodando o tempo todo)
+# Terminal 1: resource monitor (leave running the whole time)
 python3 resource_monitor.py
 
-# Terminal 2: echo responder (deixe rodando o tempo todo)
+# Terminal 2: echo responder (leave running the whole time)
 python3 echo_responder.py
 
-# Terminal 3: dispara o teste de carga (roda e termina sozinho)
+# Terminal 3: triggers the load test (runs and finishes on its own)
 python3 load_test.py
 ```
 
-Ao final, `load_test.py` grava em `load-test/results/<timestamp>/`:
-- `load_1mps.csv`, `load_5mps.csv`, ... — latências brutas de cada nível
-- `summary.csv` — min/mean/median/p95/p99/max/stdev de latência, jitter
-  médio e stdev, e taxa de perda, uma linha por nível de carga
+At the end, `load_test.py` writes to `load-test/results/<timestamp>/`:
+- `load_1mps.csv`, `load_5mps.csv`, ... — raw latencies for each level
+- `summary.csv` — min/mean/median/p95/p99/max/stdev latency, mean/stdev
+  jitter, and loss rate, one row per load level
 
-O `resource_monitor.py` grava separadamente em
-`load-test/results/resources_<timestamp>.csv` — para cruzar com o
-`summary.csv` do teste de carga, alinhe pelos timestamps (cada nível de
-carga roda por `DURATION_PER_LEVEL_S` segundos, editável no script).
+`resource_monitor.py` writes separately to
+`load-test/results/resources_<timestamp>.csv` — to cross-reference with
+the load test's `summary.csv`, align by timestamp (each load level runs
+for `DURATION_PER_LEVEL_S` seconds, editable in the script).
 
-### Ajustando os níveis de carga
+### Adjusting load levels
 
-Edite `LOAD_LEVELS` em `load_test.py` (padrão: `[1, 5, 10, 20, 50]` msg/s,
-60s cada). Comece com valores próximos ao original (o artigo usou ~1
-transação a cada 500ms ≈ 2 msg/s) e aumente gradualmente até observar
-degradação de latência, perda de mensagens, ou saturação de CPU — isso
-define o limite prático de capacidade do servidor atual (4 vCPU / 1.9 GB
-RAM).
-
-## Pendências
-
-- [ ] Copiar o projeto para o servidor via `scp` (bloqueado no momento por
-      indisponibilidade de rede/VPN até `200.133.17.234`)
-- [ ] Colar o array `dados[]` completo dentro de `firmware_mqtt.ino`
-- [ ] Rodar a validação end-to-end (Mosquitto + bridge + Grafana)
-- [ ] Rodar o experimento de carga e anexar os CSVs de resultado a este
-      repositório (ou a uma pasta `load-test/results/` versionada)
-- [ ] Confirmar se a VM é hospedagem local ou nuvem, para completar a seção
-      "Ambiente do servidor" acima
-- [ ] `git add . && git commit && git push` para publicar estas mudanças
+Edit `LOAD_LEVELS` in `load_test.py` (default: `[1, 5, 10, 20, 50]` msg/s,
+60s each). Start with values close to the original (the paper used ~1
+transaction every 500ms ≈ 2 msg/s) and increase gradually until you observe
+latency degradation, message loss, or CPU saturation — this defines the
+practical capacity limit of the current server (4 vCPU / 1.9 GB RAM).
+- [ ] Confirm whether the VM is self-hosted or cloud-hosted, to complete
+      the "Server environment" section above
+- [ ] `git add . && git commit && git push` to publish these changes
