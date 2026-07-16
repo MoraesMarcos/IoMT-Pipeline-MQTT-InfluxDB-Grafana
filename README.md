@@ -53,7 +53,7 @@ de verdade, e um bridge dedicado faz a ponte MQTT → InfluxDB.
 | Hypervisor | KVM (QEMU, hardware genérico "Standard PC i440FX + PIIX") |
 | SO | Debian GNU/Linux 12 (bookworm), kernel 5.10.0-10-amd64 |
 | InfluxDB | 1.6.7, `auth-enabled = false` |
-| Broker MQTT | Mosquitto, configuração padrão (`/etc/mosquitto/conf.d/` vazio) |
+| Broker MQTT | Mosquitto, configuração padrão (`/etc/mosquitto/conf.d/`) |
 | Grafana | ativo, dashboards em `Dashboards > MIMIC` |
 
 > Falta confirmar: se a VM é hospedagem local/própria ou provedor de nuvem
